@@ -18,6 +18,7 @@ let currentFrameBuffer = null;
 let socket = null;
 let nextEditId = 1;
 let buttonTimers = {};
+let interlaceField = 0; // Alternates between 0 and 1
 
 // --- NES Setup ---
 const nes = new jsnes.NES({
@@ -41,19 +42,23 @@ function connect() {
     socket = new WebSocket(WS_URL, { origin: 'https://ourworldoftext.com' });
 
     socket.on('open', () => {
-        console.log('Connected to OWOT!');
-        drawUIBatch();
-        console.log('2 FPS Engine Started. Use chat to control.');
+        console.log('Connected! Writing Instructions...');
+        drawInstructions();
+        console.log('Interlaced Engine Started. Type commands in chat to play.');
     });
 
     socket.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
-            // Controls via Chat
             if (msg.kind === 'chat') {
                 const cmd = msg.message.toLowerCase().trim();
                 if (CONTROLLER_MAP[cmd] !== undefined) {
-                    handleInput(cmd);
+                    nes.buttonDown(1, CONTROLLER_MAP[cmd]);
+                    if (buttonTimers[cmd]) clearTimeout(buttonTimers[cmd]);
+                    buttonTimers[cmd] = setTimeout(() => {
+                        nes.buttonUp(1, CONTROLLER_MAP[cmd]);
+                        delete buttonTimers[cmd];
+                    }, 500);
                 }
             }
         } catch (e) {}
@@ -62,79 +67,50 @@ function connect() {
     socket.on('close', () => process.exit(1));
 }
 
-function handleInput(cmd) {
-    const buttonCode = CONTROLLER_MAP[cmd];
-    nes.buttonDown(1, buttonCode);
-    if (buttonTimers[cmd]) clearTimeout(buttonTimers[cmd]);
-    buttonTimers[cmd] = setTimeout(() => {
-        nes.buttonUp(1, buttonCode);
-        delete buttonTimers[cmd];
-    }, 500); // 1/2 second hold
-}
-
-/**
- * Corrects BGR (JSNES) to RGB (OWOT)
- */
 function fixColor(c) {
+    // Correcting the BGR -> RGB swap
     const r = c & 0xFF;
     const g = (c >> 8) & 0xFF;
     const b = (c >> 16) & 0xFF;
     return (r << 16) | (g << 8) | b;
 }
 
-/**
- * Draws the instructional labels in one single batch edit
- */
-function drawUIBatch() {
-    const labels = [
-        { l: "TYPE 'UP'", x: 48, y: 128 }, { l: "TYPE 'DOWN'", x: 48, y: 144 },
-        { l: "TYPE 'LEFT'", x: 16, y: 136 }, { l: "TYPE 'RIGHT'", x: 80, y: 136 },
-        { l: "TYPE 'B'", x: 160, y: 136 }, { l: "TYPE 'A'", x: 200, y: 136 },
-        { l: "TYPE 'START'", x: 110, y: 145 }, { l: "TYPE 'SELECT'", x: 110, y: 130 }
-    ];
-
-    const edits = [];
+function drawInstructions() {
+    const text = "CHAT COMMANDS: UP, DOWN, LEFT, RIGHT, A, B, START, SELECT";
     const now = Date.now();
-
-    labels.forEach(btn => {
-        btn.l.split('').forEach((char, i) => {
-            const posX = btn.x + i;
-            const posY = btn.y;
-            edits.push([
-                Math.floor(posY / TILE_R), Math.floor(posX / TILE_C), // Tile Y, X
-                posY % TILE_R, posX % TILE_C,                        // Char Y, X
-                now, char, nextEditId++, 0xFFFFFF, 0x333333
-            ]);
-        });
-    });
-
+    const edits = text.split('').map((char, i) => [
+        16, Math.floor(i / 16), 2, i % 16, now, char, nextEditId++, 0xFFFFFF, 0x000000
+    ]);
     socket.send(JSON.stringify({ kind: 'write', edits }));
 }
 
 /**
- * Core Render Logic: Compiles every change into one giant batch
- * then slices it into network-safe packets.
+ * Interlaced Rendering Logic
  */
-function renderToOWOTBatch() {
+function renderInterlacedBatch() {
     if (!socket || socket.readyState !== WebSocket.OPEN || !currentFrameBuffer) return;
 
-    const allEdits = [];
+    const fieldEdits = [];
     const now = Date.now();
 
-    for (let y = 0; y < HEIGHT; y += 2) {
-        for (let x = 0; x < WIDTH; x++) {
-            const idxT = y * WIDTH + x;
-            const idxB = (y + 1) * WIDTH + x;
-            const cellIdx = (y / 2) * WIDTH + x;
+    // Iterate through OWOT rows (0 to 119)
+    for (let yChar = 0; yChar < 120; yChar++) {
+        // Interlacing check: Only process rows belonging to the current field
+        if (yChar % 2 !== interlaceField) continue;
 
-            const colorT = fixColor(currentFrameBuffer[idxT]);
-            const colorB = fixColor(currentFrameBuffer[idxB]);
+        for (let x = 0; x < WIDTH; x++) {
+            const idxTop = (yChar * 2) * WIDTH + x;
+            const idxBot = (yChar * 2 + 1) * WIDTH + x;
+            const cellIdx = yChar * WIDTH + x;
+
+            const colorT = fixColor(currentFrameBuffer[idxTop]);
+            const colorB = fixColor(currentFrameBuffer[idxB] || 0); // Safety check
             const hash = (colorT << 24) ^ colorB;
 
             if (lastFrameData[cellIdx] !== hash) {
-                allEdits.push([
-                    Math.floor((y / 2) / TILE_R), Math.floor(x / TILE_C), // Tile Y, X
-                    (y / 2) % TILE_R, x % TILE_C,                         // Char Y, X
+                fieldEdits.push([
+                    Math.floor(yChar / TILE_R), Math.floor(x / TILE_C), // Tile Y, X
+                    yChar % TILE_R, x % TILE_C,                         // Char Y, X
                     now, "▀", nextEditId++, colorT, colorB
                 ]);
                 lastFrameData[cellIdx] = hash;
@@ -142,13 +118,15 @@ function renderToOWOTBatch() {
         }
     }
 
-    // Process the compiled batch in chunks of 500
-    if (allEdits.length > 0) {
-        const CHUNK_SIZE = 500;
-        for (let i = 0; i < allEdits.length; i += CHUNK_SIZE) {
+    // Toggle field for next run
+    interlaceField = interlaceField === 0 ? 1 : 0;
+
+    // Send burst in chunks of 500
+    if (fieldEdits.length > 0) {
+        for (let i = 0; i < fieldEdits.length; i += 500) {
             socket.send(JSON.stringify({
                 kind: 'write',
-                edits: allEdits.slice(i, i + CHUNK_SIZE)
+                edits: fieldEdits.slice(i, i + 500)
             }));
         }
     }
@@ -160,11 +138,12 @@ async function start() {
     nes.loadROM(romData);
     connect();
 
-    // Emulator Logic Loop (60 FPS)
-    setInterval(() => { nes.frame(); }, 1000 / 60);
+    // Logic loop
+    setInterval(() => nes.frame(), 1000 / 60);
 
-    // OWOT Casting Loop (2 FPS)
-    setInterval(() => { renderToOWOTBatch(); }, 500); 
+    // Interlaced Caster loop (Interlace every 500ms)
+    // Full refresh takes 1 second, but motion updates every 0.5s
+    setInterval(() => renderInterlacedBatch(), 500); 
 }
 
 start().catch(console.error);
