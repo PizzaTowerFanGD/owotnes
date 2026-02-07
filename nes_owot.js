@@ -18,7 +18,7 @@ let currentFrameBuffer = null;
 let socket = null;
 let nextEditId = 1;
 let buttonTimers = {};
-let interlaceField = 0; // Alternates between 0 and 1
+let interlaceField = 0; // 0 for even rows, 1 for odd rows
 
 // --- NES Setup ---
 const nes = new jsnes.NES({
@@ -42,9 +42,9 @@ function connect() {
     socket = new WebSocket(WS_URL, { origin: 'https://ourworldoftext.com' });
 
     socket.on('open', () => {
-        console.log('Connected! Writing Instructions...');
-        drawInstructions();
-        console.log('Interlaced Engine Started. Type commands in chat to play.');
+        console.log('Connected to OWOT!');
+        drawLabels();
+        console.log('Interlaced 2 FPS Engine Active. Controls via Chat.');
     });
 
     socket.on('message', (data) => {
@@ -67,15 +67,17 @@ function connect() {
     socket.on('close', () => process.exit(1));
 }
 
+/**
+ * Fixes BGR (NES) to RGB (OWOT)
+ */
 function fixColor(c) {
-    // Correcting the BGR -> RGB swap
     const r = c & 0xFF;
     const g = (c >> 8) & 0xFF;
     const b = (c >> 16) & 0xFF;
     return (r << 16) | (g << 8) | b;
 }
 
-function drawInstructions() {
+function drawLabels() {
     const text = "CHAT COMMANDS: UP, DOWN, LEFT, RIGHT, A, B, START, SELECT";
     const now = Date.now();
     const edits = text.split('').map((char, i) => [
@@ -85,7 +87,8 @@ function drawInstructions() {
 }
 
 /**
- * Interlaced Rendering Logic
+ * Interlaced batch renderer.
+ * One char '▀' = 2 vertical pixels. Total 120 char rows for 240 pixels.
  */
 function renderInterlacedBatch() {
     if (!socket || socket.readyState !== WebSocket.OPEN || !currentFrameBuffer) return;
@@ -93,9 +96,8 @@ function renderInterlacedBatch() {
     const fieldEdits = [];
     const now = Date.now();
 
-    // Iterate through OWOT rows (0 to 119)
     for (let yChar = 0; yChar < 120; yChar++) {
-        // Interlacing check: Only process rows belonging to the current field
+        // Only process rows matching the current interlace field (0 or 1)
         if (yChar % 2 !== interlaceField) continue;
 
         for (let x = 0; x < WIDTH; x++) {
@@ -104,7 +106,7 @@ function renderInterlacedBatch() {
             const cellIdx = yChar * WIDTH + x;
 
             const colorT = fixColor(currentFrameBuffer[idxTop]);
-            const colorB = fixColor(currentFrameBuffer[idxB] || 0); // Safety check
+            const colorB = fixColor(currentFrameBuffer[idxBot]);
             const hash = (colorT << 24) ^ colorB;
 
             if (lastFrameData[cellIdx] !== hash) {
@@ -118,11 +120,11 @@ function renderInterlacedBatch() {
         }
     }
 
-    // Toggle field for next run
-    interlaceField = interlaceField === 0 ? 1 : 0;
+    // Switch field for the next 500ms cycle
+    interlaceField = (interlaceField === 0) ? 1 : 0;
 
-    // Send burst in chunks of 500
     if (fieldEdits.length > 0) {
+        // Send in batches of 500 to prevent server throttling
         for (let i = 0; i < fieldEdits.length; i += 500) {
             socket.send(JSON.stringify({
                 kind: 'write',
@@ -138,11 +140,10 @@ async function start() {
     nes.loadROM(romData);
     connect();
 
-    // Logic loop
+    // Game engine speed (60fps)
     setInterval(() => nes.frame(), 1000 / 60);
 
-    // Interlaced Caster loop (Interlace every 500ms)
-    // Full refresh takes 1 second, but motion updates every 0.5s
+    // OWOT display speed (Interlaced 2fps)
     setInterval(() => renderInterlacedBatch(), 500); 
 }
 
