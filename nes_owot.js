@@ -14,12 +14,16 @@ const TILE_C = 16;
 const TILE_R = 8;
 
 let lastFrameData = new Uint32Array(WIDTH * (HEIGHT / 2));
+let currentFrameBuffer = null;
 let socket = null;
 let nextEditId = 1;
 let buttonTimers = {};
 
+// --- NES Setup ---
 const nes = new jsnes.NES({
-    onFrame: (frameBuffer) => renderToOWOT(frameBuffer)
+    onFrame: (frameBuffer) => {
+        currentFrameBuffer = new Uint32Array(frameBuffer);
+    }
 });
 
 const CONTROLLER_MAP = {
@@ -33,34 +37,24 @@ const CONTROLLER_MAP = {
     'select': jsnes.Controller.BUTTON_SELECT
 };
 
-const UI_PADS = [
-    { label: "UP",    cmd: 'up',     tx: 3,  ty: 16 },
-    { label: "LEFT",  cmd: 'left',   tx: 1,  ty: 17 },
-    { label: "RIGHT", cmd: 'right',  tx: 5,  ty: 17 },
-    { label: "DOWN",  cmd: 'down',   tx: 3,  ty: 18 },
-    { label: "SEL",   cmd: 'select', tx: 8,  ty: 17 },
-    { label: "START", cmd: 'start',  tx: 10, ty: 17 },
-    { label: "B",     cmd: 'b',      tx: 13, ty: 17 },
-    { label: "A",     cmd: 'a',      tx: 15, ty: 17 }
-];
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
 function connect() {
     socket = new WebSocket(WS_URL, { origin: 'https://ourworldoftext.com' });
 
-    socket.on('open', async () => {
-        console.log('Connected! Staggering Big Pad Generation (1s per button)...');
-        await setupControllerPads();
-        console.log('Controller UI Complete.');
+    socket.on('open', () => {
+        console.log('Connected to OWOT!');
+        drawUIBatch();
+        console.log('2 FPS Engine Started. Use chat to control.');
     });
 
     socket.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
-            if (msg.kind === 'cmd') {
-                const cmd = msg.data.toLowerCase().trim();
-                handleButtonPress(cmd);
+            // Controls via Chat
+            if (msg.kind === 'chat') {
+                const cmd = msg.message.toLowerCase().trim();
+                if (CONTROLLER_MAP[cmd] !== undefined) {
+                    handleInput(cmd);
+                }
             }
         } catch (e) {}
     });
@@ -68,22 +62,18 @@ function connect() {
     socket.on('close', () => process.exit(1));
 }
 
-function handleButtonPress(cmd) {
+function handleInput(cmd) {
     const buttonCode = CONTROLLER_MAP[cmd];
-    if (buttonCode === undefined) return;
-
     nes.buttonDown(1, buttonCode);
     if (buttonTimers[cmd]) clearTimeout(buttonTimers[cmd]);
-    
-    // Hold button for 1/2 second
     buttonTimers[cmd] = setTimeout(() => {
         nes.buttonUp(1, buttonCode);
         delete buttonTimers[cmd];
-    }, 500);
+    }, 500); // 1/2 second hold
 }
 
 /**
- * Fixes Color mapping: Swap Red and Blue channels.
+ * Corrects BGR (JSNES) to RGB (OWOT)
  */
 function fixColor(c) {
     const r = c & 0xFF;
@@ -93,51 +83,42 @@ function fixColor(c) {
 }
 
 /**
- * Creates pads one-by-one with a delay to prevent OWOT server packet loss.
+ * Draws the instructional labels in one single batch edit
  */
-async function setupControllerPads() {
-    for (const pad of UI_PADS) {
-        console.log(`Setting up button: ${pad.label}...`);
-        const edits = [];
-        const now = Date.now();
+function drawUIBatch() {
+    const labels = [
+        { l: "TYPE 'UP'", x: 48, y: 128 }, { l: "TYPE 'DOWN'", x: 48, y: 144 },
+        { l: "TYPE 'LEFT'", x: 16, y: 136 }, { l: "TYPE 'RIGHT'", x: 80, y: 136 },
+        { l: "TYPE 'B'", x: 160, y: 136 }, { l: "TYPE 'A'", x: 200, y: 136 },
+        { l: "TYPE 'START'", x: 110, y: 145 }, { l: "TYPE 'SELECT'", x: 110, y: 130 }
+    ];
 
-        const startX = Math.floor((16 - pad.label.length) / 2);
-        const startY = 3;
+    const edits = [];
+    const now = Date.now();
 
-        for (let r = 0; r < TILE_R; r++) {
-            for (let c = 0; c < TILE_C; c++) {
-                let char = " ";
-                if (r === startY && c >= startX && c < startX + pad.label.length) {
-                    char = pad.label[c - startX];
-                }
+    labels.forEach(btn => {
+        btn.l.split('').forEach((char, i) => {
+            const posX = btn.x + i;
+            const posY = btn.y;
+            edits.push([
+                Math.floor(posY / TILE_R), Math.floor(posX / TILE_C), // Tile Y, X
+                posY % TILE_R, posX % TILE_C,                        // Char Y, X
+                now, char, nextEditId++, 0xFFFFFF, 0x333333
+            ]);
+        });
+    });
 
-                // Visual edit
-                edits.push([pad.ty, pad.tx, r, c, now, char, nextEditId++, 0xFFFFFF, 0x444444]);
-
-                // Link packet
-                socket.send(JSON.stringify({
-                    kind: 'link',
-                    type: 'url',
-                    data: {
-                        tileY: pad.ty, tileX: pad.tx,
-                        charY: r, charX: c,
-                        url: `comu:${pad.cmd}`
-                    }
-                }));
-            }
-        }
-        
-        // Write the visual part of this specific button
-        socket.send(JSON.stringify({ kind: 'write', edits }));
-        
-        // Wait 1 second before doing the next button to let the server breathe
-        await sleep(1000);
-    }
+    socket.send(JSON.stringify({ kind: 'write', edits }));
 }
 
-function renderToOWOT(frameBuffer) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const edits = [];
+/**
+ * Core Render Logic: Compiles every change into one giant batch
+ * then slices it into network-safe packets.
+ */
+function renderToOWOTBatch() {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !currentFrameBuffer) return;
+
+    const allEdits = [];
     const now = Date.now();
 
     for (let y = 0; y < HEIGHT; y += 2) {
@@ -146,16 +127,14 @@ function renderToOWOT(frameBuffer) {
             const idxB = (y + 1) * WIDTH + x;
             const cellIdx = (y / 2) * WIDTH + x;
 
-            const colorT = fixColor(frameBuffer[idxT]);
-            const colorB = fixColor(frameBuffer[idxB]);
-
+            const colorT = fixColor(currentFrameBuffer[idxT]);
+            const colorB = fixColor(currentFrameBuffer[idxB]);
             const hash = (colorT << 24) ^ colorB;
+
             if (lastFrameData[cellIdx] !== hash) {
-                edits.push([
-                    Math.floor((y / 2) / TILE_R), 
-                    Math.floor(x / TILE_C),       
-                    (y / 2) % TILE_R,             
-                    x % TILE_C,                   
+                allEdits.push([
+                    Math.floor((y / 2) / TILE_R), Math.floor(x / TILE_C), // Tile Y, X
+                    (y / 2) % TILE_R, x % TILE_C,                         // Char Y, X
                     now, "▀", nextEditId++, colorT, colorB
                 ]);
                 lastFrameData[cellIdx] = hash;
@@ -163,10 +142,14 @@ function renderToOWOT(frameBuffer) {
         }
     }
 
-    if (edits.length > 0) {
-        const BATCH = 450;
-        for (let i = 0; i < edits.length; i += BATCH) {
-            socket.send(JSON.stringify({ kind: 'write', edits: edits.slice(i, i + BATCH) }));
+    // Process the compiled batch in chunks of 500
+    if (allEdits.length > 0) {
+        const CHUNK_SIZE = 500;
+        for (let i = 0; i < allEdits.length; i += CHUNK_SIZE) {
+            socket.send(JSON.stringify({
+                kind: 'write',
+                edits: allEdits.slice(i, i + CHUNK_SIZE)
+            }));
         }
     }
 }
@@ -176,6 +159,12 @@ async function start() {
     const romData = Buffer.from(await res.arrayBuffer()).toString('binary');
     nes.loadROM(romData);
     connect();
+
+    // Emulator Logic Loop (60 FPS)
     setInterval(() => { nes.frame(); }, 1000 / 60);
+
+    // OWOT Casting Loop (2 FPS)
+    setInterval(() => { renderToOWOTBatch(); }, 500); 
 }
-start();
+
+start().catch(console.error);
