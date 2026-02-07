@@ -1,0 +1,37 @@
+name: NES to OWOT Caster
+
+on:
+  workflow_dispatch:
+    inputs:
+      world_name:
+        description: 'The OWOT world name (e.g., owotness)'
+        required: true
+        default: 'owotness'
+      rom_url:
+        description: 'Direct link to the .nes ROM file'
+        required: true
+      member_key:
+        description: 'Your OWOT Member Key (optional but recommended for speed)'
+        required: false
+
+jobs:
+  run-nes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install Dependencies
+        run: npm install ws jsnes node-fetch@2
+
+      - name: Run Emulator
+        env:
+          WORLD_NAME: ${{ github.event.inputs.world_name }}
+          ROM_URL: ${{ github.event.inputs.rom_url }}
+          MEMBER_KEY: ${{ github.event.inputs.member_key }}
+        run: node nes_owot.js
