@@ -33,8 +33,6 @@ const CONTROLLER_MAP = {
     'select': jsnes.Controller.BUTTON_SELECT
 };
 
-// --- Big Pad Layout ---
-// Each button is exactly 1 OWOT Tile (16x8 chars)
 const UI_PADS = [
     { label: "UP",    cmd: 'up',     tx: 3,  ty: 16 },
     { label: "LEFT",  cmd: 'left',   tx: 1,  ty: 17 },
@@ -46,12 +44,15 @@ const UI_PADS = [
     { label: "A",     cmd: 'a',      tx: 15, ty: 17 }
 ];
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 function connect() {
     socket = new WebSocket(WS_URL, { origin: 'https://ourworldoftext.com' });
 
-    socket.on('open', () => {
-        console.log('Connected! Generating Big Pad Controller...');
-        setupControllerPads();
+    socket.on('open', async () => {
+        console.log('Connected! Staggering Big Pad Generation (1s per button)...');
+        await setupControllerPads();
+        console.log('Controller UI Complete.');
     });
 
     socket.on('message', (data) => {
@@ -59,14 +60,7 @@ function connect() {
             const msg = JSON.parse(data);
             if (msg.kind === 'cmd') {
                 const cmd = msg.data.toLowerCase().trim();
-                if (CONTROLLER_MAP[cmd] !== undefined) {
-                    nes.buttonDown(1, CONTROLLER_MAP[cmd]);
-                    if (buttonTimers[cmd]) clearTimeout(buttonTimers[cmd]);
-                    buttonTimers[cmd] = setTimeout(() => {
-                        nes.buttonUp(1, CONTROLLER_MAP[cmd]);
-                        delete buttonTimers[cmd];
-                    }, 500);
-                }
+                handleButtonPress(cmd);
             }
         } catch (e) {}
     });
@@ -74,9 +68,22 @@ function connect() {
     socket.on('close', () => process.exit(1));
 }
 
+function handleButtonPress(cmd) {
+    const buttonCode = CONTROLLER_MAP[cmd];
+    if (buttonCode === undefined) return;
+
+    nes.buttonDown(1, buttonCode);
+    if (buttonTimers[cmd]) clearTimeout(buttonTimers[cmd]);
+    
+    // Hold button for 1/2 second
+    buttonTimers[cmd] = setTimeout(() => {
+        nes.buttonUp(1, buttonCode);
+        delete buttonTimers[cmd];
+    }, 500);
+}
+
 /**
- * Fixes the Color swap. 
- * NES buffer is often 0xBBGGRR, OWOT wants 0xRRGGBB.
+ * Fixes Color mapping: Swap Red and Blue channels.
  */
 function fixColor(c) {
     const r = c & 0xFF;
@@ -85,27 +92,29 @@ function fixColor(c) {
     return (r << 16) | (g << 8) | b;
 }
 
-function setupControllerPads() {
-    const edits = [];
-    const now = Date.now();
+/**
+ * Creates pads one-by-one with a delay to prevent OWOT server packet loss.
+ */
+async function setupControllerPads() {
+    for (const pad of UI_PADS) {
+        console.log(`Setting up button: ${pad.label}...`);
+        const edits = [];
+        const now = Date.now();
 
-    UI_PADS.forEach(pad => {
-        // Label positioning (center of the 16x8 tile)
         const startX = Math.floor((16 - pad.label.length) / 2);
         const startY = 3;
 
         for (let r = 0; r < TILE_R; r++) {
             for (let c = 0; c < TILE_C; c++) {
                 let char = " ";
-                // Draw label if we are in the center area
                 if (r === startY && c >= startX && c < startX + pad.label.length) {
                     char = pad.label[c - startX];
                 }
 
-                // Tile Background: Dark Grey (0x444444), Text: White
+                // Visual edit
                 edits.push([pad.ty, pad.tx, r, c, now, char, nextEditId++, 0xFFFFFF, 0x444444]);
 
-                // Attach comu link to every single character in the tile
+                // Link packet
                 socket.send(JSON.stringify({
                     kind: 'link',
                     type: 'url',
@@ -117,12 +126,12 @@ function setupControllerPads() {
                 }));
             }
         }
-    });
-
-    // Send visual update in batches
-    const BATCH = 400;
-    for (let i = 0; i < edits.length; i += BATCH) {
-        socket.send(JSON.stringify({ kind: 'write', edits: edits.slice(i, i + BATCH) }));
+        
+        // Write the visual part of this specific button
+        socket.send(JSON.stringify({ kind: 'write', edits }));
+        
+        // Wait 1 second before doing the next button to let the server breathe
+        await sleep(1000);
     }
 }
 
@@ -137,17 +146,16 @@ function renderToOWOT(frameBuffer) {
             const idxB = (y + 1) * WIDTH + x;
             const cellIdx = (y / 2) * WIDTH + x;
 
-            // Apply the BGR -> RGB swap here
             const colorT = fixColor(frameBuffer[idxT]);
             const colorB = fixColor(frameBuffer[idxB]);
 
             const hash = (colorT << 24) ^ colorB;
             if (lastFrameData[cellIdx] !== hash) {
                 edits.push([
-                    Math.floor((y / 2) / TILE_R), // Tile Y
-                    Math.floor(x / TILE_C),       // Tile X
-                    (y / 2) % TILE_R,             // Char Y
-                    x % TILE_C,                   // Char X
+                    Math.floor((y / 2) / TILE_R), 
+                    Math.floor(x / TILE_C),       
+                    (y / 2) % TILE_R,             
+                    x % TILE_C,                   
                     now, "▀", nextEditId++, colorT, colorB
                 ]);
                 lastFrameData[cellIdx] = hash;
@@ -164,7 +172,6 @@ function renderToOWOT(frameBuffer) {
 }
 
 async function start() {
-    console.log('Fetching ROM...');
     const res = await fetch(ROM_URL);
     const romData = Buffer.from(await res.arrayBuffer()).toString('binary');
     nes.loadROM(romData);
